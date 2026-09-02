@@ -7,6 +7,8 @@
   "vars": {
     "DASHBOARD_URL": "https://maddalakum.github.io/neopilot-dashboard/",
     "ALLOWED_ORIGINS": "http://127.0.0.1:4173,http://localhost:4173,https://maddalakum.github.io",
-    "GITHUB_REPOSITORY": "maddalakum/Suploads"
+    "GITHUB_REPOSITORY": "maddalakum/Suploads",
+    "LIVE_TRADING_ENABLED": "true",
+    "MANAGED_EXITS_ENABLED": "false"
   }
 }

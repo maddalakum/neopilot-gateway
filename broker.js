@@ -9,6 +9,7 @@ const OPTION_CHAIN_UNDERLYINGS = Object.freeze({
 });
 const accountCache = new Map();
 const expiryCache = new Map();
+const liveOrderLocks = new Set();
 
 function safeText(value) {
   return String(value ?? '')
@@ -206,6 +207,17 @@ function readHeaders(account, formEncoded = false) {
   return {
     Accept: formEncoded ? '*/*' : 'application/json',
     ...(formEncoded ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
+    Sid: account.sid,
+    Auth: account.authToken,
+  };
+}
+
+function tradeHeaders(account) {
+  if (account.role !== 'trade') throw new Error('Trade credential role is required.');
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    Authorization: account.consumerKey,
     Sid: account.sid,
     Auth: account.authToken,
   };
@@ -443,11 +455,13 @@ export async function bootstrap(env, events, force = false) {
     })),
     refreshMs: config.refreshMs,
     trading: {
-      mode: 'preview',
-      liveEnabled: false,
+      mode: tradingLimits(env).liveEnabled ? 'live-entry' : 'preview',
+      liveEnabled: tradingLimits(env).liveEnabled,
       managedExitsEnabled: false,
       maxLots: tradingLimits(env).maxLots,
-      note: 'Order submission remains locked while persistent fill and exit tracking is being verified.',
+      note: tradingLimits(env).liveEnabled
+        ? 'Guarded live entry is enabled. Managed profit exits and live manual exits remain locked.'
+        : 'Order submission is locked by gateway configuration.',
     },
   };
 }
@@ -520,7 +534,25 @@ function validatePreviewRequestId(value) {
   return requestId;
 }
 
-export async function orderPreview(env, accountId, draft, events) {
+async function liveOrderTag(requestId) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(requestId));
+  const suffix = Array.from(new Uint8Array(digest).slice(0, 8), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `NP${suffix}`;
+}
+
+function rowOrderTag(row) {
+  return String(row?.GuiOrdId ?? row?.guiOrdId ?? row?.ig ?? row?.tag ?? '').trim();
+}
+
+function rowOrderId(row) {
+  return String(row?.nOrdNo ?? row?.orderId ?? row?.ordId ?? '').trim();
+}
+
+function rowOrderStatus(row) {
+  return String(row?.ordSt ?? row?.status ?? row?.stat ?? 'SUBMITTED').trim() || 'SUBMITTED';
+}
+
+async function validatedEntry(env, accountId, draft, events) {
   const context = await accountContext(env, accountId, events);
   if (!context.tradeAccount.sid || !context.tradeAccount.authToken || !context.tradeAccount.consumerKey) {
     throw new Error(`${context.meta.tradeFile} is not ready for order placement.`);
@@ -540,16 +572,10 @@ export async function orderPreview(env, accountId, draft, events) {
   const contract = await resolveSignal(draft?.signal, events);
   const quantity = lots * Math.max(1, integer(contract.lotSize, 1));
   const targetSide = side === 'BUY' ? 'SELL' : 'BUY';
-  const targetRule = profitPoints > 0
-    ? `${targetSide} LIMIT at full-fill average ${side === 'BUY' ? '+' : '-'} ${profitPoints}`
-    : 'No automatic profit order';
-
-  events.push(event(`${context.meta.label} order preview`, 'success', `${side} ${quantity} ${contract.tradingSymbol} validated with ${context.meta.tradeFile}; no order was sent.`));
   return {
-    accountId: context.meta.id,
+    context,
+    limits,
     requestId,
-    executionMode: 'preview',
-    liveSubmissionEnabled: false,
     contract,
     order: {
       side,
@@ -569,15 +595,93 @@ export async function orderPreview(env, accountId, draft, events) {
       side: targetSide,
       quantity,
       price: null,
-      rule: targetRule,
+      rule: profitPoints > 0
+        ? `${targetSide} LIMIT at full-fill average ${side === 'BUY' ? '+' : '-'} ${profitPoints}`
+        : 'No automatic profit order',
       activation: profitPoints > 0 ? 'Only after the complete entry fill and its average price are confirmed.' : 'Disabled',
     },
+  };
+}
+
+export async function orderPreview(env, accountId, draft, events) {
+  const { context, limits, requestId, contract, order, managedTarget } = await validatedEntry(env, accountId, draft, events);
+
+  events.push(event(`${context.meta.label} order preview`, 'success', `${order.side} ${order.quantity} ${contract.tradingSymbol} validated with ${context.meta.tradeFile}; no order was sent.`));
+  return {
+    accountId: context.meta.id,
+    requestId,
+    executionMode: 'preview',
+    liveSubmissionEnabled: limits.liveEnabled,
+    contract,
+    order,
+    managedTarget,
     safeguards: [
       'The contract was resolved again inside the secure gateway.',
       `The trade credential role is ${context.meta.tradeFile}; read credentials were not used for this preview.`,
       'This preview does not place, modify, or cancel a Kotak order.',
     ],
   };
+}
+
+export async function placeOrder(env, accountId, draft, events) {
+  const { context, limits, requestId, contract, order, managedTarget } = await validatedEntry(env, accountId, draft, events);
+  if (!limits.liveEnabled) throw new Error('Live order submission is disabled in the secure gateway.');
+  if (managedTarget.profitPoints > 0) {
+    throw new Error('Set profit points to 0 before sending a live entry. Managed profit exits are not enabled yet.');
+  }
+  const expectedPhrase = `${order.side} ${order.quantity}`;
+  if (draft?.confirmed !== true || String(draft?.confirmationPhrase || '').trim().toUpperCase() !== expectedPhrase) {
+    throw new Error(`Type ${expectedPhrase} to confirm this live order.`);
+  }
+
+  const tag = await liveOrderTag(requestId);
+  const lockKey = `${context.meta.id}|${tag}`;
+  if (liveOrderLocks.has(lockKey)) throw new Error('This live order request is already being submitted. Check the Order Book before trying again.');
+  liveOrderLocks.add(lockKey);
+  try {
+    const orderReport = await fetchOrders(context.readAccount, context.meta, events);
+    const existing = dataRows(orderReport).find((row) => rowOrderTag(row) === tag);
+    if (existing) {
+      const existingOrderId = rowOrderId(existing);
+      events.push(event(`${context.meta.label} live order`, 'warning', `A matching Kotak order already exists${existingOrderId ? ` (${existingOrderId})` : ''}; no duplicate was sent.`));
+      return {
+        ok: true,
+        duplicate: true,
+        accountId: context.meta.id,
+        requestId,
+        order: {
+          id: existingOrderId || 'Existing order', status: rowOrderStatus(existing), symbol: contract.tradingSymbol,
+          side: order.side, quantity: order.quantity, type: order.orderType, price: order.price, product: order.product, tag,
+        },
+      };
+    }
+
+    const jData = {
+      am: 'NO', dq: '0', es: contract.exchangeSegment, mp: '0', pc: order.product,
+      pr: order.orderType === 'LIMIT' ? String(order.price) : '0', pt: order.brokerPriceType,
+      qt: String(order.quantity), rt: 'DAY', tp: '0', ts: contract.tradingSymbol,
+      tt: order.brokerTransactionType, ig: tag, os: 'NEOTRADEAPI',
+    };
+    const response = assertNeoResponse(`${context.meta.label} live order`, await requestJson(
+      neoUrl(context.tradeAccount, 'quick/order/rule/ms/place'),
+      { method: 'POST', headers: tradeHeaders(context.tradeAccount), body: new URLSearchParams({ jData: JSON.stringify(jData) }) },
+      `${context.meta.label} live order`,
+      events,
+    ));
+    const orderId = String(response?.nOrdNo ?? response?.orderId ?? '').trim();
+    if (!orderId) throw new Error('Kotak did not return an order number. Check the Order Book before trying again.');
+    const status = String(response?.stat ?? response?.status ?? 'SUBMITTED').trim() || 'SUBMITTED';
+    events.push(event(`${context.meta.label} live order`, 'success', `${order.side} ${order.quantity} ${contract.tradingSymbol} sent to Kotak. Order ${orderId}.`));
+    return {
+      ok: true, duplicate: false, accountId: context.meta.id, requestId,
+      order: {
+        id: orderId, status, symbol: contract.tradingSymbol, side: order.side, quantity: order.quantity,
+        type: order.orderType, price: order.price, product: order.product, tag,
+      },
+    };
+  } finally {
+    liveOrderLocks.delete(lockKey);
+  }
 }
 
 export async function exitPreview(env, accountId, draft, events) {

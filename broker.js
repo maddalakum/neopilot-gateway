@@ -3,8 +3,9 @@ import { accountConfiguration } from './accounts.config.js';
 const GITHUB_API = 'https://api.github.com';
 const OPTION_CHAIN_MINI_URL = 'https://mksapi.kotaksecurities.com/30newserviceapi/watchlist/v1/optionchain_mini';
 const OPTION_CHAIN_UNDERLYINGS = Object.freeze({
-  SENSEX: Object.freeze({ exchangeSegment: 'bse_cm', exchangeId: 'SENSEX', derivativeSegment: 'bse_fo' }),
-  NIFTY: Object.freeze({ exchangeSegment: 'nse_cm', exchangeId: 'Nifty 50', derivativeSegment: 'nse_fo' }),
+  SENSEX: Object.freeze({ exchangeSegment: 'bse_cm', exchangeId: 'SENSEX', derivativeSegment: 'bse_fo', defaultLotSize: 20 }),
+  NIFTY: Object.freeze({ exchangeSegment: 'nse_cm', exchangeId: 'Nifty 50', derivativeSegment: 'nse_fo', defaultLotSize: 65 }),
+  BANKNIFTY: Object.freeze({ exchangeSegment: 'nse_cm', exchangeId: 'Nifty Bank', derivativeSegment: 'nse_fo', defaultLotSize: 30 }),
 });
 const accountCache = new Map();
 const expiryCache = new Map();
@@ -39,6 +40,24 @@ function indiaDate() {
 function number(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function integer(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+function positiveInteger(value, fallback = 1) {
+  const parsed = integer(value, fallback);
+  return parsed > 0 ? parsed : fallback;
+}
+
+function tradingLimits(env) {
+  return {
+    maxLots: Math.min(100, Math.max(1, integer(env.MAX_ORDER_LOTS, 10))),
+    liveEnabled: String(env.LIVE_TRADING_ENABLED || '').toLowerCase() === 'true',
+    managedExitsEnabled: String(env.MANAGED_EXITS_ENABLED || '').toLowerCase() === 'true',
+  };
 }
 
 function dataRows(value) {
@@ -374,7 +393,7 @@ function selectContract(data, signal, expiry) {
   return {
     tradingSymbol: String(contract.symbol), instrumentToken: String(contract.exchId),
     exchangeSegment: expiry.derivativeSegment, optionType, strike,
-    lotSize: number(data.common_data?.mktLot, expiry.lotSize),
+    lotSize: positiveInteger(data.common_data?.mktLot, expiry.lotSize),
   };
 }
 
@@ -383,7 +402,7 @@ async function resolveSignal(signal, events) {
   const optionType = String(signal?.optionType || '').toUpperCase();
   const strike = Number(signal?.strike);
   if (!OPTION_CHAIN_UNDERLYINGS[underlying] || !['CE', 'PE'].includes(optionType) || !Number.isFinite(strike) || strike <= 0) {
-    throw new Error('Signal must contain SENSEX or NIFTY, strike price, and CE/PE.');
+    throw new Error('Signal must contain SENSEX, NIFTY, or BANKNIFTY, strike price, and CE/PE.');
   }
   const source = OPTION_CHAIN_UNDERLYINGS[underlying];
   const cacheKey = `${underlying}|${indiaDate()}`;
@@ -394,7 +413,7 @@ async function resolveSignal(signal, events) {
     const expiry = nearestExpiry(data.expiries);
     const derivativeSegment = String(data.common_data?.exSeg || '').toLowerCase();
     if (derivativeSegment !== source.derivativeSegment) throw new Error('Kotak returned an unexpected derivatives segment.');
-    cached = { ...expiry, derivativeSegment, lotSize: number(data.common_data?.mktLot, 1), initialChainData: data };
+    cached = { ...expiry, derivativeSegment, lotSize: positiveInteger(data.common_data?.mktLot, source.defaultLotSize), initialChainData: data };
     expiryCache.set(cacheKey, cached);
   }
   let contract;
@@ -423,6 +442,13 @@ export async function bootstrap(env, events, force = false) {
       tradeReady: Boolean(tradeAccount.sid && tradeAccount.authToken && tradeAccount.consumerKey),
     })),
     refreshMs: config.refreshMs,
+    trading: {
+      mode: 'preview',
+      liveEnabled: false,
+      managedExitsEnabled: false,
+      maxLots: tradingLimits(env).maxLots,
+      note: 'Order submission remains locked while persistent fill and exit tracking is being verified.',
+    },
   };
 }
 
@@ -461,6 +487,150 @@ export async function details(env, accountId, events) {
 export async function signalContract(env, accountId, signal, events) {
   await accountContext(env, accountId, events);
   return resolveSignal(signal, events);
+}
+
+function normalizedOrderType(value) {
+  const type = String(value || '').trim().toUpperCase();
+  if (!['MKT', 'LIMIT'].includes(type)) throw new Error('Order type must be MKT or LIMIT.');
+  return type;
+}
+
+function normalizedTransactionSide(value) {
+  const side = String(value || '').trim().toUpperCase();
+  if (!['BUY', 'SELL'].includes(side)) throw new Error('Transaction side must be BUY or SELL.');
+  return side;
+}
+
+function normalizedProduct(value) {
+  const product = String(value || 'NRML').trim().toUpperCase();
+  if (!['NRML', 'MIS'].includes(product)) throw new Error('Product must be NRML or MIS.');
+  return product;
+}
+
+function positiveLimitPrice(orderType, value) {
+  if (orderType === 'MKT') return null;
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) throw new Error('Enter a valid limit price greater than zero.');
+  return Math.round(price * 100) / 100;
+}
+
+function validatePreviewRequestId(value) {
+  const requestId = String(value || '').trim();
+  if (!/^[A-Za-z0-9-]{12,80}$/.test(requestId)) throw new Error('The order preview request ID is invalid.');
+  return requestId;
+}
+
+export async function orderPreview(env, accountId, draft, events) {
+  const context = await accountContext(env, accountId, events);
+  if (!context.tradeAccount.sid || !context.tradeAccount.authToken || !context.tradeAccount.consumerKey) {
+    throw new Error(`${context.meta.tradeFile} is not ready for order placement.`);
+  }
+  const limits = tradingLimits(env);
+  const side = normalizedTransactionSide(draft?.side);
+  const orderType = normalizedOrderType(draft?.orderType);
+  const product = normalizedProduct(draft?.product);
+  const lots = integer(draft?.lots);
+  if (lots < 1 || lots > limits.maxLots) throw new Error(`Lots must be between 1 and ${limits.maxLots}.`);
+  const profitPoints = integer(draft?.profitPoints, -1);
+  if (profitPoints < 0 || profitPoints > 100000) {
+    throw new Error('Profit points must be a whole number between 0 and 100000.');
+  }
+  const price = positiveLimitPrice(orderType, draft?.price);
+  const requestId = validatePreviewRequestId(draft?.clientRequestId);
+  const contract = await resolveSignal(draft?.signal, events);
+  const quantity = lots * Math.max(1, integer(contract.lotSize, 1));
+  const targetSide = side === 'BUY' ? 'SELL' : 'BUY';
+  const targetRule = profitPoints > 0
+    ? `${targetSide} LIMIT at full-fill average ${side === 'BUY' ? '+' : '-'} ${profitPoints}`
+    : 'No automatic profit order';
+
+  events.push(event(`${context.meta.label} order preview`, 'success', `${side} ${quantity} ${contract.tradingSymbol} validated with ${context.meta.tradeFile}; no order was sent.`));
+  return {
+    accountId: context.meta.id,
+    requestId,
+    executionMode: 'preview',
+    liveSubmissionEnabled: false,
+    contract,
+    order: {
+      side,
+      brokerTransactionType: side === 'BUY' ? 'B' : 'S',
+      orderType,
+      brokerPriceType: orderType === 'LIMIT' ? 'L' : 'MKT',
+      price,
+      product,
+      validity: 'DAY',
+      lots,
+      lotSize: contract.lotSize,
+      quantity,
+    },
+    managedTarget: {
+      enabled: profitPoints > 0,
+      profitPoints,
+      side: targetSide,
+      quantity,
+      price: null,
+      rule: targetRule,
+      activation: profitPoints > 0 ? 'Only after the complete entry fill and its average price are confirmed.' : 'Disabled',
+    },
+    safeguards: [
+      'The contract was resolved again inside the secure gateway.',
+      `The trade credential role is ${context.meta.tradeFile}; read credentials were not used for this preview.`,
+      'This preview does not place, modify, or cancel a Kotak order.',
+    ],
+  };
+}
+
+export async function exitPreview(env, accountId, draft, events) {
+  const context = await accountContext(env, accountId, events);
+  if (!context.tradeAccount.sid || !context.tradeAccount.authToken || !context.tradeAccount.consumerKey) {
+    throw new Error(`${context.meta.tradeFile} is not ready for order placement.`);
+  }
+  const orderType = normalizedOrderType(draft?.orderType);
+  const price = positiveLimitPrice(orderType, draft?.price);
+  const requestId = validatePreviewRequestId(draft?.clientRequestId);
+  const positionResponse = await fetchPositions(context.readAccount, context.meta, events);
+  const normalized = normalizeSnapshot(positionResponse, null, null, null);
+  const requestedToken = String(draft?.instrumentToken || '').trim();
+  const requestedSymbol = String(draft?.tradingSymbol || '').trim().toUpperCase();
+  const position = normalized.positions.find((item) => (requestedToken && item.instrumentToken === requestedToken)
+    || (requestedSymbol && item.tradingSymbol.toUpperCase() === requestedSymbol));
+  if (!position || position.status !== 'OPEN' || !position.netQuantity) {
+    throw new Error('The selected position is no longer open. Refresh positions before preparing an exit.');
+  }
+  const side = position.netQuantity > 0 ? 'SELL' : 'BUY';
+  const quantity = Math.abs(position.netQuantity);
+  events.push(event(`${context.meta.label} exit preview`, 'success', `${side} ${quantity} ${position.tradingSymbol} validated against the latest open position; no order was sent.`));
+  return {
+    accountId: context.meta.id,
+    requestId,
+    executionMode: 'preview',
+    liveSubmissionEnabled: false,
+    position: {
+      tradingSymbol: position.tradingSymbol,
+      instrumentToken: position.instrumentToken,
+      exchangeId: position.exchangeId,
+      exchangeSegment: position.exchangeSegment,
+      product: position.product,
+      netQuantity: position.netQuantity,
+      lotSize: position.lotSize,
+      lots: position.lots,
+    },
+    exitOrder: {
+      side,
+      brokerTransactionType: side === 'BUY' ? 'B' : 'S',
+      orderType,
+      brokerPriceType: orderType === 'LIMIT' ? 'L' : 'MKT',
+      price,
+      product: position.product || 'NRML',
+      validity: 'DAY',
+      quantity,
+    },
+    safeguards: [
+      'The full exit quantity was reloaded from Kotak positions inside the secure gateway.',
+      'Before a live full exit, any open target or stop order for this contract must be cancelled to prevent a reverse position.',
+      'This preview does not place, modify, or cancel a Kotak order.',
+    ],
+  };
 }
 
 export { event, parseConfiguration };

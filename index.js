@@ -1,6 +1,6 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-import { bootstrap, details, event, positions, signalContract, snapshot } from './broker.js';
+import { bootstrap, details, event, exitPreview, orderPreview, positions, signalContract, snapshot } from './broker.js';
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
@@ -220,6 +220,12 @@ async function handleRequest(request, env) {
           contract: await signalContract(env, body.accountId, body.signal, events),
           events,
         }, 200, cors);
+      }
+      if (url.pathname === '/api/order/preview') {
+        return json({ preview: await orderPreview(env, body.accountId, body.draft, events), events }, 200, cors);
+      }
+      if (url.pathname === '/api/exit/preview') {
+        return json({ preview: await exitPreview(env, body.accountId, body.draft, events), events }, 200, cors);
       }
     } catch (error) {
       events.push(event('Secure gateway', 'error', error instanceof Error ? error.message : 'Request failed.'));

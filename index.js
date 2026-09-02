@@ -151,7 +151,12 @@ async function handleRequest(request, env) {
     return json({
       ok: true,
       service: 'neopilot-secure-gateway',
+      release: '2026-09-03-live-entry-v1',
       date: indiaDate(),
+      trading: {
+        liveEntryEnabled: String(env.LIVE_TRADING_ENABLED || '').toLowerCase() === 'true',
+        managedExitsEnabled: false,
+      },
       configured: {
         githubPat: configured(env.GITHUB_PAT),
         ownerKey: configured(env.OWNER_KEY),

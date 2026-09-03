@@ -1,6 +1,6 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-import { bootstrap, details, event, exitPreview, orderPreview, placeOrder, positions, signalContract, snapshot } from './broker.js';
+import { bootstrap, details, event, exitPreview, openOrderPositionStream, orderPreview, placeOrder, positions, signalContract, snapshot } from './broker.js';
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
@@ -101,6 +101,36 @@ async function verifyDailyToken(token, secret) {
   );
 }
 
+async function createStreamTicket(secret, accountId) {
+  const payload = bytesToBase64Url(encoder.encode(JSON.stringify({
+    version: 'stream-v1',
+    date: indiaDate(),
+    accountId: String(accountId || '').trim(),
+    expiresAt: Math.floor(Date.now() / 1000) + 60,
+  })));
+  const signature = await crypto.subtle.sign('HMAC', await hmacKey(secret), encoder.encode(payload));
+  return `${payload}.${bytesToBase64Url(new Uint8Array(signature))}`;
+}
+
+async function verifyStreamTicket(token, secret) {
+  const [payload, signature] = String(token || '').split('.');
+  if (!payload || !signature) return null;
+  let decoded;
+  try {
+    decoded = JSON.parse(decoder.decode(base64UrlToBytes(payload)));
+  } catch {
+    return null;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (decoded.version !== 'stream-v1' || decoded.date !== indiaDate()
+    || !/^[A-Za-z0-9_-]{1,60}$/.test(String(decoded.accountId || ''))
+    || !Number.isInteger(decoded.expiresAt) || decoded.expiresAt < now || decoded.expiresAt > now + 90) return null;
+  const valid = await crypto.subtle.verify(
+    'HMAC', await hmacKey(secret), base64UrlToBytes(signature), encoder.encode(payload),
+  );
+  return valid ? decoded : null;
+}
+
 async function authorizedSession(request, env) {
   return configured(env.ACCESS_SIGNING_SECRET)
     && verifyDailyToken(bearerToken(request), env.ACCESS_SIGNING_SECRET);
@@ -151,7 +181,7 @@ async function handleRequest(request, env) {
     return json({
       ok: true,
       service: 'neopilot-secure-gateway',
-      release: '2026-09-03-live-entry-v1',
+      release: '2026-09-03-live-entry-stream-v1',
       date: indiaDate(),
       trading: {
         liveEntryEnabled: String(env.LIVE_TRADING_ENABLED || '').toLowerCase() === 'true',
@@ -166,6 +196,18 @@ async function handleRequest(request, env) {
   }
 
   assertAllowedOrigin(request, env);
+
+  if (request.method === 'GET' && url.pathname === '/api/stream') {
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return json({ error: 'WebSocket upgrade required' }, 426, cors);
+    }
+    if (!configured(env.ACCESS_SIGNING_SECRET) || !configured(env.GITHUB_PAT)) {
+      return json({ error: 'Gateway streaming is not configured' }, 503, cors);
+    }
+    const ticket = await verifyStreamTicket(url.searchParams.get('ticket'), env.ACCESS_SIGNING_SECRET);
+    if (!ticket) return json({ error: 'Stream ticket is invalid or expired' }, 401, cors);
+    return openOrderPositionStream(env, ticket.accountId);
+  }
 
   if (request.method === 'POST' && url.pathname === '/owner/access-link') {
     if (!configured(env.OWNER_KEY) || !configured(env.ACCESS_SIGNING_SECRET)) {
@@ -208,6 +250,11 @@ async function handleRequest(request, env) {
     try {
       if (url.pathname === '/api/bootstrap') {
         return json({ ...(await bootstrap(env, events, Boolean(body.force))), events }, 200, cors);
+      }
+      if (url.pathname === '/api/stream/ticket') {
+        const accountId = String(body.accountId || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,60}$/.test(accountId)) throw new Error('Select a valid account before starting the live stream.');
+        return json({ ticket: await createStreamTicket(env.ACCESS_SIGNING_SECRET, accountId), expiresInSeconds: 60, events }, 200, cors);
       }
       if (url.pathname === '/api/snapshot') {
         return json({ snapshot: await snapshot(env, body.accountId, events, Boolean(body.force)), events }, 200, cors);

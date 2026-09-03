@@ -684,6 +684,103 @@ export async function placeOrder(env, accountId, draft, events) {
   }
 }
 
+function realtimeUpgradeUrl(baseURL) {
+  const url = new URL(baseURL);
+  url.pathname = '/realtime';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function feedField(data, ...names) {
+  for (const name of names) {
+    if (data?.[name] !== undefined && data?.[name] !== null) return safeText(data[name]);
+  }
+  return '';
+}
+
+export function sanitizeOrderPositionFrame(raw) {
+  if (typeof raw !== 'string' || raw.length > 100000) return null;
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const type = String(payload?.type || '').trim().toLowerCase();
+  if (!['order', 'position'].includes(type)) return null;
+  const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  if (type === 'order') {
+    return {
+      type,
+      data: {
+        orderId: feedField(data, 'nOrdNo', 'orderId'),
+        status: feedField(data, 'ordSt', 'status'),
+        tradingSymbol: feedField(data, 'trdSym', 'sym', 'symbol'),
+        token: feedField(data, 'tok', 'token'),
+        side: feedField(data, 'trnsTp', 'transactionType'),
+        quantity: feedField(data, 'qty', 'quantity'),
+        filledQuantity: feedField(data, 'fldQty', 'filledQuantity'),
+        averagePrice: feedField(data, 'avgPrc', 'averagePrice'),
+      },
+      receivedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    type,
+    data: {
+      symbol: feedField(data, 'sym', 'symbol'),
+      exchangeSegment: feedField(data, 'exSeg', 'exchangeSegment'),
+      product: feedField(data, 'prod', 'product'),
+      filledBuyQuantity: feedField(data, 'flBuyQty', 'filledBuyQuantity'),
+      filledSellQuantity: feedField(data, 'flSellQty', 'filledSellQuantity'),
+      buyAmount: feedField(data, 'buyAmt', 'buyAmount'),
+      sellAmount: feedField(data, 'sellAmt', 'sellAmount'),
+      lotSize: feedField(data, 'lotSz', 'lotSize'),
+      updateTime: feedField(data, 'hsUpTm', 'updateTime'),
+    },
+    receivedAt: new Date().toISOString(),
+  };
+}
+
+export async function openOrderPositionStream(env, accountId) {
+  const events = [];
+  const context = await accountContext(env, accountId, events);
+  if (!context.readAccount.sid || !context.readAccount.authToken) {
+    throw new Error(`${context.meta.readFile} is not ready for the order and position stream.`);
+  }
+  const upstreamResponse = await fetch(realtimeUpgradeUrl(context.readAccount.baseURL), {
+    headers: { Upgrade: 'websocket' },
+  });
+  const upstream = upstreamResponse.webSocket;
+  if (!upstream) throw new Error('Kotak did not accept the order and position WebSocket connection.');
+
+  const pair = new WebSocketPair();
+  const [client, server] = Object.values(pair);
+  upstream.accept();
+  server.accept();
+
+  const closeBoth = (code = 1011, reason = 'Stream closed') => {
+    try { upstream.close(code, reason); } catch { /* Already closed. */ }
+    try { server.close(code, reason); } catch { /* Already closed. */ }
+  };
+  upstream.addEventListener('message', (message) => {
+    const sanitized = sanitizeOrderPositionFrame(message.data);
+    if (!sanitized) return;
+    try { server.send(JSON.stringify(sanitized)); } catch { closeBoth(); }
+  });
+  upstream.addEventListener('close', (message) => closeBoth(message.code === 1000 ? 1000 : 1011, 'Kotak stream closed'));
+  upstream.addEventListener('error', () => closeBoth(1011, 'Kotak stream error'));
+  server.addEventListener('close', () => {
+    try { upstream.close(1000, 'Dashboard disconnected'); } catch { /* Already closed. */ }
+  });
+  server.addEventListener('error', () => closeBoth());
+
+  upstream.send(`{type:cn,Authorization:${context.readAccount.authToken},Sid:${context.readAccount.sid},src:WEB}`);
+  server.send(JSON.stringify({ type: 'ready', accountId: context.meta.id, receivedAt: new Date().toISOString() }));
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 export async function exitPreview(env, accountId, draft, events) {
   const context = await accountContext(env, accountId, events);
   if (!context.tradeAccount.sid || !context.tradeAccount.authToken || !context.tradeAccount.consumerKey) {
